@@ -1,12 +1,21 @@
 (ns io.gregson.icfp.monroeville.um
+  (:gen-class)
   (:import [jline Terminal]
            [java.nio ByteBuffer]
            [org.apache.commons.io IOUtils])
   (:require [gloss.core :as g]
             [gloss.io :as gio]
             [clojure.java.io :as io]
-            [clojure.tools.logging :as log]
-            [lanterna.terminal :as t]))
+            [clojure.tools.logging :as log]))
+
+(defn read-char
+  "Reads the next character from stream that is the current value of *in* ."
+  {:added "1.0"
+   :static true}
+  []
+  (if (instance? clojure.lang.LineNumberingPushbackReader *in*)
+    (.read ^clojure.lang.LineNumberingPushbackReader *in*)
+    (.read ^java.io.BufferedReader *in*)))
 
 (def
   ^{:private true
@@ -14,11 +23,11 @@
   data-frame
   (g/compile-frame :uint32-be))
 
-(def
-  ^{:private true
-    :doc "A Lanterna terminal to act as the UM terminal."}
-  term
-  (t/get-terminal :swing))
+(defrecord machine [finger registers arrays])
+(defn mk-machine
+  "Make a new machine!"
+  [prog]
+  (->machine 0 (make-array Long/TYPE 8) {0 (aclone ^longs prog)}))
 
 (def
   ^{:private true
@@ -54,87 +63,78 @@
 
 (defn- read-register
   "Read the value in an UM register."
-  [reg]
-  (bit-and 0xFFFFFFFF (nth @registers reg)))
+  [m reg]
+  (bit-and 0xFFFFFFFF (aget ^longs (:registers m) reg)))
 
 (defn- set-register
   "Sets the value in an UM register."
-  [reg v]
-  (dosync
-   (ref-set registers (assoc @registers reg (bit-and 0xFFFFFFFF v)))))
+  [m reg v]
+  (aset-long (:registers m) reg (bit-and 0xFFFFFFFF v))
+  m)
 
 (defn- read-array
   "Read the value in an array at an offset."
-  [array offset]
-  (let [data (nth @arrays array)
+  [m array offset]
+  (let [data (get (:arrays m) array)
         size (count data)]
     (if (< size offset)
-      (raise-error (format "ARRAY OFFSET: %d (%d)"
-                           offset
-                           size))
-      (bit-and 0xFFFFFFFF (nth data offset)))))
+      (raise-error m (format "ARRAY OFFSET: %d (%d)"
+                             offset
+                             size))
+      (bit-and 0xFFFFFFFF (aget ^longs data offset)))))
 
 (defn- set-array
   "Set the value in an array at an offset."
-  [array offset v]
-  (dosync
-   (if (not (= (type v) java.lang.Long))
-     (raise-error "INVALID-PARAM"))
-   (if (< (count @arrays) array)
-     (raise-error "INVALID ARRAY"))
-   (let [start-array (nth @arrays array)
-         size (count start-array)]
-     (if (< size offset)
-       (raise-error "ARRAY OFFSET")
-       (ref-set arrays
-                (assoc @arrays array (assoc start-array offset v)))))))
+  [m array offset v]
+  (if (not (= (type v) java.lang.Long))
+    (raise-error m "INVALID-PARAM"))
+  (if (not (contains? (:arrays m) array))
+    (raise-error m "INVALID ARRAY"))
+  (let [data (get (:arrays m) array)
+        size (count data)]
+    (if (< size offset)
+      (raise-error m "ARRAY OFFSET")
+      (aset-long data offset v))
+    m))
 
 (defn- get-free-array-id
   "Find an available array identifier."
-  []
-  (dosync
-   (if (not (empty? @array-pool))
-     (let [id (first @array-pool)]
-       (ref-set array-pool (rest @array-pool))
-       id))
-   (if (> 4294967295 (count @arrays))
-     (count @arrays)
-     (raise-error "ARRAY SPACE EXHAUSTED"))))
+  [m]
+  (loop [idx (rand-int Integer/MAX_VALUE)]
+    (if (contains? (:arrays m) idx)
+      (recur (rand-int Integer/MAX_VALUE))
+      idx)))
 
 (defn- allocate-array
   "Create a new array in the UM, return the array identifier."
-  [size]
-  (let [array-id (get-free-array-id)]
-    (dosync
-     (ref-set arrays
-              (assoc @arrays array-id (into [] (repeat size 0))))
-     array-id)))
+  [m size]
+  (let [array-id (get-free-array-id m)
+        m2 (assoc m :arrays (assoc (:arrays m)
+                              array-id
+                              (make-array Long/TYPE size)))]
+    (list array-id m2)))
 
 (defn- free-array
   "Free an array in the UM."
-  [array]
-  (dosync
-   (if (or (= 0 array)
-           (< (count @arrays) array)
-           (= 0 (nth @arrays array)))
-     (raise-error "INVALID ARRAY"))
-   (ref-set arrays (assoc @arrays array 0))
-   (ref-set array-pool (cons array @array-pool))))
+  [m array]
+  (if (or (= 0 array)
+          (not (contains? (:arrays m) array)))
+    (raise-error m "INVALID ARRAY"))
+  (assoc m :arrays (dissoc (:arrays m) array)))
 
 (defn- set-display
   "Set the display output."
   [data]
   (if (< 255 data)
     (throw (Exception. "OUTPUT")))
-  (dosync
-   (ref-set display (bit-and 0x000000FF data))
-   (t/put-character term (char @display))))
+  (print (char data))
+  (flush))
 
 (defn- read-input
   "Read input in from the console."
   []
   (try
-    (t/get-key-blocking term)
+    (long (read-char))
     (catch Exception e
       0xFFFFFFFF)))
 
@@ -144,128 +144,116 @@
   instructions
   (vector
    ;; Conditional Move
-   (fn [a b c]
-     (if (not (= 0 (read-register c)))
-       (do
-         (log/debug (format "MOVE %d ({%d}) -> {%d}"
-                            (read-register b)
-                            b
-                            a))
-         (set-register a (read-register b)))
-       (log/debug "NOOP")))
+   (fn [m a b c]
+     (if (not (= 0 (read-register m c)))
+       (set-register m a (read-register m b)))
+     m)
 
    ;; Array Index
-   (fn [a b c]
-     (log/debug (format "LOAD %d[%d] -> {%d}"
-                        (read-register b)
-                        (read-register c)
-                        a))
-     (set-register a (read-array (read-register b)
-                                 (read-register c))))
+   (fn [m a b c]
+     (set-register m
+                   a
+                   (read-array m
+                               (read-register m b)
+                               (read-register m c)))
+     m)
 
    ;; Array Amendment
-   (fn [a b c]
-     (log/debug (format "PUT %d -> %d[%d]"
-                        (read-register c)
-                        (read-register a)
-                        (read-register b)))
-     (set-array (read-register a)
-                (read-register b)
-                (read-register c)))
+   (fn [m a b c]
+     (set-array m
+                (read-register m a)
+                (read-register m b)
+                (read-register m c))
+     m)
 
    ;; Addition
-   (fn [a b c]
-     (log/debug (format "ADD %d + %d -> {%d}"
-                        (read-register b)
-                        (read-register c)
-                        a))
-     (set-register a (+ (read-register b)
-                        (read-register c))))
+   (fn [m a b c]
+     (set-register m
+                   a
+                   (+ (read-register m b)
+                      (read-register m c)))
+     m)
 
    ;; Multiplication
-   (fn [a b c]
-     (log/debug (format "MUL %d * %d -> {%d}"
-                        (read-register b)
-                        (read-register c)
-                        a))
-     (set-register a (* (read-register b)
-                        (read-register c))))
+   (fn [m a b c]
+     (set-register m
+                   a
+                   (* (read-register m b)
+                      (read-register m c)))
+     m)
 
    ;; Division
-   (fn [a b c]
-     (let [c-val (read-register c)]
+   (fn [m a b c]
+     (let [c-val (read-register m c)]
        (if (= 0 c-val)
          (throw (Exception. "INVALID DIVISION")))
-       (log/debug (format "DIV %d / %d -> {%d}"
-                          (read-register b)
-                          c-val
-                          a))
-       (set-register a (int (/ (read-register b)
-                               c-val)))))
+       (set-register m
+                     a
+                     (long (/ (read-register m b)
+                              c-val)))
+       m))
 
    ;; Not-And
-   (fn [a b c]
-     (log/debug (format "NAND %d nand %d -> {%d}"
-                        (read-register b)
-                        (read-register c)
-                        a))
-     (set-register a (bit-or (bit-not (read-register b))
-                             (bit-not (read-register c)))))
+   (fn [m a b c]
+     (set-register m
+                   a
+                   (bit-or (bit-not (read-register m b))
+                           (bit-not (read-register m c))))
+     m)
 
    ;; Halt
-   (fn [a b c]
+   (fn [m a b c]
      (log/info "HALT")
      (throw (Exception. "HALT")))
 
    ;; Allocation
-   (fn [a b c]
-     (log/debug (format "ALLOC %d -> {%d}"
-                        (read-register c)
-                        b))
-     (set-register b (allocate-array (read-register c))))
+   (fn [m a b c]
+     (let [[array-id m2] (allocate-array m
+                                         (read-register m c))]
+       (set-register m2
+                     b
+                     array-id)))
 
    ;; Abandonment
-   (fn [a b c]
-     (log/debug (format "FREE %d[]"
-                        c))
-     (free-array (read-register c)))
+   (fn [m a b c]
+     (free-array m (read-register m c)))
 
    ;; Output
-   (fn [a b c]
-     (log/debug (format "PRINT %d"
-                        (read-register c)))
-     (set-display (read-register c)))
+   (fn [m a b c]
+     (set-display (read-register m c))
+     m)
 
    ;; Input
-   (fn [a b c]
-     (log/debug (format "READ {%d}" c))
-     (set-register c (read-input)))
+   (fn [m a b c]
+     (set-register m c (read-input))
+     m)
 
    ;; Load Program
-   (fn [a b c]
-     (let [b-val (read-register b)
-           c-val (read-register c)]
-       (if (or (< (count @arrays) b-val)
-               (= 0 (nth @arrays b-val)))
-         (raise-error  "INVALID ARRAY")
-         (dosync
-          (log/debug (format "PROGN %d[] %d"
-                             b-val
-                             c-val))
-          (ref-set arrays
-                   (assoc @arrays 0 (nth @arrays b-val)))
-          (ref-set finger c-val)))))
+   (fn [m a b c]
+     (let [b-val (read-register m b)
+           c-val (read-register m c)]
+       (if (not (contains? (:arrays m) b-val))
+         (raise-error m  "INVALID ARRAY")
+         (let [m2 (if (< 0 b-val)
+                    (assoc m
+                      :arrays
+                      (assoc (:arrays m)
+                        0
+                        (aclone ^longs (get (:arrays m)
+                                            b-val))))
+                    m)]
+           (assoc m2 :finger c-val)))))
 
    ;; Orthography
-   (fn [a v]
-     (log/debug (format "ORTHO {%d} %d" a v))
-     (set-register a v))))
+   (fn [m a v]
+     (set-register m a v)
+     m)))
 
 (defn decode-instruction
   "Convert an instruction number into a function."
-  [num]
+  [m num]
   (if (> num (count instructions))
-    (raise-error  "INVALID INSTRUCTION")
+    (raise-error m "INVALID INSTRUCTION")
     (nth instructions num)))
 
 (defn decoder-for
@@ -284,84 +272,71 @@
                   (list
                    (bit-and 0x00000007 (unsigned-bit-shift-right data 25))
                    (bit-and (bit-not 0xFE000000) data)))))
-              
-
-(defn zero-registers
-  "Zero the UM registers."
-  []
-  (dosync
-   (ref-set registers (vector 0 0 0 0 0 0 0 0))))
 
 (defn- read-finger
   "Read the point at the finger."
-  []
-  (read-array 0 @finger))
+  [m]
+  (read-array m 0 (:finger m)))
 
 (defn set-finger
   "Set the UM finger point to a specified location."
-  [loc]
-  (dosync
-   (ref-set finger loc)))
+  [m loc]
+  (assoc m :finger loc))
 
 (defn- raise-error
   "Raise an error - an exception is thrown with a message that includes state."
-  [message]
-  (dosync
-   (let [address @finger
-         data (read-finger)
-         instr-num (unsigned-bit-shift-right data 28)
-         instr (decode-instruction instr-num)
-         decoder (decoder-for instr-num)
-         decoded-params (decoder data)
-         details (format "Address: %08d   Data: %08x   Instruction: %02d %s"
-                         address data instr-num decoded-params)]
-     (log/error details)
-     (log/error @registers)
-     (throw (Exception. message)))))
+  [m message]
+  (let [address (:finger m)
+        data (read-finger m)
+        instr-num (unsigned-bit-shift-right data 28)
+        instr (decode-instruction m instr-num)
+        decoder (decoder-for instr-num)
+        decoded-params (decoder data)
+        details (format "Address: %08d   Data: %08x   Instruction: %02d %s"
+                        address data instr-num decoded-params)]
+    (log/error details)
+    (log/error (:registers m))
+    (throw (Exception. ^String message))))
 
 (defn load-scroll
   "Load a scroll, zero all registers, and set the finger to 0."
   [scroll-name]
   (with-open [i (io/input-stream scroll-name)]
-    (let [bytes (gio/decode-all data-frame (IOUtils/toByteArray i))]
-      (dosync
-       (ref-set arrays (assoc @arrays 0 bytes)))))
-  (zero-registers)
-  (set-finger 0)
-  (log/info (format "Scroll loaded: %s" scroll-name)))
+    (let [bytes (gio/decode-all data-frame (IOUtils/toByteArray i))
+          prog-array (make-array Long/TYPE (count bytes))]
+      (doseq [itr (map (fn [a b] {:idx a :data b}) (iterate inc 0) bytes)]
+        (aset-long prog-array (:idx itr) (:data itr)))
+      (log/info (format "Scroll loaded: %s" scroll-name))
+      (mk-machine prog-array))))
 
 (defn execute-step
   "Execute the instruction at the UM finger and increment the finger."
-  []
-  (let [finger-val (read-finger)
+  [m]
+  (let [finger-val (read-finger m)
         instr-num (unsigned-bit-shift-right finger-val 28)
-        instr (decode-instruction instr-num)
+        instr (decode-instruction m instr-num)
         decoder (decoder-for instr-num)
         decoded-params (decoder finger-val)]
-    (log/trace (format "Address: %08d    Data: %08x    Instruction: %02d %s"
-                       @finger finger-val instr-num decoded-params))
-    (log/trace @registers)
-    (set-finger (+ 1 @finger))
-    (apply instr decoded-params)))
+    (apply instr (cons (set-finger m (+ 1 (:finger m)))
+                       decoded-params))))
 
 (defn execute-scroll
   [scroll]
-  (load-scroll scroll)
-  (while true 
-    (doseq [i (range 1000000)]
-      (execute-step))
-    (log/infof "Registers: %s  Finger: %d  Arrays: %d"
-               @registers
-               @finger
-               (count @arrays))))
+  (loop [m (load-scroll scroll)
+         c 0]
+    (if (= (mod c 1000000) 0)
+      (log/infof "Registers: %s  Finger: %d  Arrays: %d"
+                 (apply format (cons "%08x %08x %08x %08x %08x %08x %08x %08x"
+                                     (seq (:registers m))))
+                 (:finger m)
+                 (count (:arrays m))))
+    (recur (execute-step m) (+ 1 c))))
 
 (defn -main
-  []
+  [& args]
   (log/info "BOOT")
   (try
-    (t/start term)
-    (execute-scroll "/home/mgregson/downloads/codex.umz")
+    (execute-scroll (or (first args)
+                        "/home/mgregson/downloads/codex.umz"))
     (catch Exception e
-      (log/fatal e "Eplosion:"))
-    (finally
-      (t/stop term))))
+      (log/fatal e "Eplosion:"))))
